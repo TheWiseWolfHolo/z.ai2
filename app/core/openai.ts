@@ -5,48 +5,87 @@
 import { Router } from "oak/mod.ts";
 import { config } from "./config.ts";
 import { 
-  OpenAIRequest, Message, UpstreamRequest, ModelItem, 
-  ModelsResponse, Model, OpenAIRequestSchema
+  Message, UpstreamRequest,
+  ModelsResponse, OpenAIRequestSchema
 } from "../models/schemas.ts";
 import { debugLog, generateRequestIds, getAuthToken } from "../utils/helpers.ts";
 import { processMessagesWithTools, contentToString } from "../utils/tools.ts";
 import { StreamResponseHandler, NonStreamResponseHandler } from "./response_handlers.ts";
+import { getAvailableModels } from "../utils/model_fetcher.ts";
 
 export const openaiRouter = new Router();
 
 openaiRouter.get("/models", async (ctx) => {
-  /**List available models*/
-  const currentTime = Math.floor(Date.now() / 1000);
-  const response: ModelsResponse = {
-    object: "list",
-    data: [
-      {
-        id: config.PRIMARY_MODEL,
+  /**List available models with automatic fetching*/
+  try {
+    const availableModels = await getAvailableModels();
+    
+    const response: ModelsResponse = {
+      object: "list",
+      data: availableModels.map(model => ({
+        id: model.id,
         object: "model",
-        created: currentTime,
-        owned_by: "z.ai"
-      },
-      {
-        id: config.THINKING_MODEL,
-        object: "model",
-        created: currentTime,
-        owned_by: "z.ai"
-      },
-      {
-        id: config.SEARCH_MODEL,
-        object: "model",
-        created: currentTime,
-        owned_by: "z.ai"
-      },
-      {
-        id: config.AIR_MODEL,
-        object: "model",
-        created: currentTime,
-        owned_by: "z.ai"
-      },
-    ]
-  };
-  ctx.response.body = response;
+        created: model.created || Math.floor(Date.now() / 1000),
+        owned_by: model.owned_by || "z.ai"  
+      }))
+    };
+    
+    debugLog(`返回 ${availableModels.length} 个可用模型`);
+    ctx.response.body = response;
+  } catch (error) {
+    debugLog(`获取模型列表失败: ${error}`);
+    
+    // 回退到默认模型列表
+    const currentTime = Math.floor(Date.now() / 1000);
+    const response: ModelsResponse = {
+      object: "list",
+      data: [
+        {
+          id: config.PRIMARY_MODEL,
+          object: "model",
+          created: currentTime,
+          owned_by: "z.ai"
+        },
+        {
+          id: config.THINKING_MODEL,
+          object: "model",
+          created: currentTime,
+          owned_by: "z.ai"
+        },
+        {
+          id: config.SEARCH_MODEL,
+          object: "model",
+          created: currentTime,
+          owned_by: "z.ai"
+        },
+        {
+          id: config.AIR_MODEL,
+          object: "model",
+          created: currentTime,
+          owned_by: "z.ai"
+        },
+        {
+          id: config.PRIMARY_MODEL_NEW,
+          object: "model",
+          created: currentTime,
+          owned_by: "z.ai"
+        },
+        {
+          id: config.THINKING_MODEL_NEW,
+          object: "model",
+          created: currentTime,
+          owned_by: "z.ai"
+        },
+        {
+          id: config.SEARCH_MODEL_NEW,
+          object: "model",
+          created: currentTime,
+          owned_by: "z.ai"
+        },
+      ]
+    };
+    ctx.response.body = response;
+  }
 });
 
 openaiRouter.post("/chat/completions", async (ctx) => {
@@ -111,7 +150,9 @@ openaiRouter.post("/chat/completions", async (ctx) => {
     const isThinking = request.model === config.THINKING_MODEL;
     const isSearch = request.model === config.SEARCH_MODEL;
     const isAir = request.model === config.AIR_MODEL;
-    const searchMcp = isSearch ? "deep-web-search" : "";
+    const isNewThinking = request.model === config.THINKING_MODEL_NEW;
+    const isNewSearch = request.model === config.SEARCH_MODEL_NEW;
+    const searchMcp = isSearch || isNewSearch ? "deep-web-search" : "";
     
     // Determine upstream model ID based on requested model
     let upstreamModelId: string;
@@ -119,6 +160,15 @@ openaiRouter.post("/chat/completions", async (ctx) => {
     if (isAir) {
       upstreamModelId = "0727-106B-API"; // AIR model upstream ID
       upstreamModelName = "GLM-4.5-Air";
+    } else if (request.model === config.PRIMARY_MODEL_NEW || isNewThinking || isNewSearch) {
+      upstreamModelId = "GLM-4-6-API-V1"; // New GLM-4.6 model upstream ID
+      if (isNewThinking) {
+        upstreamModelName = "GLM-4.6-Thinking";
+      } else if (isNewSearch) {
+        upstreamModelName = "GLM-4.6-Search";
+      } else {
+        upstreamModelName = "GLM-4.6";
+      }
     } else {
       upstreamModelId = "0727-360B-API"; // Default upstream model ID
       upstreamModelName = "GLM-4.5";
@@ -133,9 +183,9 @@ openaiRouter.post("/chat/completions", async (ctx) => {
       messages: upstreamMessages,
       params: {},
       features: {
-        enable_thinking: isThinking,
-        web_search: isSearch,
-        auto_web_search: isSearch,
+        enable_thinking: isThinking || isNewThinking,
+        web_search: isSearch || isNewSearch,
+        auto_web_search: isSearch || isNewSearch,
       },
       background_tasks: {
         title_generation: false,
@@ -172,8 +222,9 @@ openaiRouter.post("/chat/completions", async (ctx) => {
       ctx.response.headers.set("Content-Type", "text/event-stream");
       ctx.response.headers.set("Cache-Control", "no-cache");
       ctx.response.headers.set("Connection", "keep-alive");
+      ctx.response.headers.set("Access-Control-Allow-Origin", "*");
       
-      // Create a readable stream
+      // Create a readable stream with better error handling
       const stream = new ReadableStream({
         async start(controller) {
           try {
@@ -182,26 +233,50 @@ openaiRouter.post("/chat/completions", async (ctx) => {
             }
             controller.close();
           } catch (error) {
-            controller.error(error);
+            debugLog(`流式响应处理错误: ${error}`);
+            // 发送错误信息到客户端
+            try {
+              const errorChunk = `data: {"error": {"message": "Stream processing error", "type": "internal_error"}}\n\n`;
+              controller.enqueue(new TextEncoder().encode(errorChunk));
+              controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+            } catch (controllerError) {
+              debugLog(`控制器错误: ${controllerError}`);
+            }
+            controller.close();
           }
+        },
+        cancel() {
+          debugLog("客户端取消了流式响应");
         }
       });
       
       ctx.response.body = stream;
     } else {
-      const handler = new NonStreamResponseHandler(upstreamReq, chatId, authToken, hasTools);
-      const response = await handler.handle();
-      
-      // Copy response properties
-      ctx.response.status = response.status;
-      ctx.response.headers = response.headers;
-      ctx.response.body = await response.text();
+      try {
+        const handler = new NonStreamResponseHandler(upstreamReq, chatId, authToken, hasTools);
+        const response = await handler.handle();
+        
+        // Copy response properties
+        ctx.response.status = response.status;
+        ctx.response.headers = response.headers;
+        ctx.response.body = await response.text();
+      } catch (nonStreamError) {
+        debugLog(`非流式响应处理错误: ${nonStreamError}`);
+        ctx.response.status = 500;
+        ctx.response.body = { error: `Non-stream processing error: ${nonStreamError}` };
+      }
     }
         
   } catch (error) {
-    debugLog(`处理请求时发生错误: ${error}`);
+    debugLog(`外层请求处理错误: ${error}`);
     console.error("Error stack:", error);
-    ctx.response.status = 500;
-    ctx.response.body = { error: `Internal server error: ${error}` };
+    
+    // 只有在响应还没有开始时才设置错误响应
+    if (!ctx.response.body) {
+      ctx.response.status = 500;
+      ctx.response.body = { error: `Internal server error: ${error}` };
+    } else {
+      debugLog("响应已开始，无法设置错误状态");
+    }
   }
 });

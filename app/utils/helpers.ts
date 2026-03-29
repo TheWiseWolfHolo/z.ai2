@@ -5,9 +5,9 @@
 import { config } from "../core/config.ts";
 
 // 全局 UserAgent 实例，避免每次调用都创建新实例
-let _userAgentInstance: any = null;
+let _userAgentInstance: Record<string, string> | null = null;
 
-async function getUserAgentInstance() {
+function getUserAgentInstance() {
   if (_userAgentInstance === null) {
     // 使用简单的随机User-Agent生成
     const userAgents = [
@@ -27,7 +27,7 @@ async function getUserAgentInstance() {
   return _userAgentInstance;
 }
 
-export function debugLog(message: string, ...args: any[]): void {
+export function debugLog(message: string, ...args: unknown[]): void {
   /**Log debug message if debug mode is enabled*/
   if (config.DEBUG_LOGGING) {
     if (args.length > 0) {
@@ -38,6 +38,56 @@ export function debugLog(message: string, ...args: any[]): void {
   }
 }
 
+/**
+ * 生成API请求所需的签名头部
+ * 签名参数逻辑实现
+ */
+export async function generateSignatureHeaders(
+  token: string, 
+  body: string = "", 
+  method: string = "POST"
+): Promise<Record<string, string>> {
+  // 生成时间戳（毫秒）
+  const timestamp = Date.now().toString();
+  
+  // 生成16位随机nonce
+  const randomBytes = new Uint8Array(8);
+  crypto.getRandomValues(randomBytes);
+  const nonce = Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16);
+  
+  // 生成签名字符串: method + "\n" + timestamp + "\n" + nonce + "\n" + body
+  const signString = `${method}\n${timestamp}\n${nonce}\n${body}`;
+  
+  // 使用HMAC-SHA256生成签名
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(token),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    encoder.encode(signString)
+  );
+  
+  // 将签名转换为十六进制字符串
+  const signatureHex = Array.from(new Uint8Array(signature))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+  
+  debugLog(`🔐 生成签名头部: timestamp=${timestamp}, nonce=${nonce.substring(0, 8)}..., signature=${signatureHex.substring(0, 16)}...`);
+  
+  return {
+    "X-Timestamp": timestamp,
+    "X-Nonce": nonce,
+    "X-Signature": signatureHex
+  };
+}
+
 export function generateRequestIds(): [string, string] {
   /**Generate unique IDs for chat and message*/
   const timestamp = Math.floor(Date.now() / 1000);
@@ -46,11 +96,11 @@ export function generateRequestIds(): [string, string] {
   return [chatId, msgId];
 }
 
-export async function getBrowserHeaders(refererChatId: string = ""): Promise<Record<string, string>> {
+export function getBrowserHeaders(refererChatId: string = ""): Record<string, string> {
   /**Get browser headers for API requests with dynamic User-Agent*/
   
   // 获取 UserAgent 实例
-  const ua = await getUserAgentInstance();
+  const ua = getUserAgentInstance();
   
   // 随机选择一个浏览器类型，偏向使用 Chrome 和 Edge
   const browserChoices = ['chrome', 'chrome', 'chrome', 'edge', 'edge', 'firefox', 'safari'];
@@ -120,7 +170,7 @@ export async function getBrowserHeaders(refererChatId: string = ""): Promise<Rec
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
-    "X-FE-Version": "prod-fe-1.0.70",
+    "X-FE-Version": "prod-fe-1.0.79",
     "Origin": config.CLIENT_HEADERS["Origin"],
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
@@ -146,10 +196,15 @@ export async function getBrowserHeaders(refererChatId: string = ""): Promise<Rec
 
 export async function getAnonymousToken(): Promise<string> {
   /**Get anonymous token for authentication*/
-  const headers = await getBrowserHeaders();
+  const headers = getBrowserHeaders();
   headers["Accept"] = "*/*";
   headers["Accept-Language"] = "zh-CN,zh;q=0.9";
   headers["Referer"] = `${config.CLIENT_HEADERS['Origin']}/`;
+  
+  // 为获取token添加签名头部（使用临时token）
+  const tempToken = "anonymous";
+  const signatureHeaders = await generateSignatureHeaders(tempToken, "", "GET");
+  Object.assign(headers, signatureHeaders);
   
   try {
     const response = await fetch(
@@ -217,24 +272,64 @@ export function transformThinkingContent(content: string): string {
 }
 
 export async function callUpstreamApi(
-  upstreamReq: any,
+  upstreamReq: Record<string, unknown>,
   chatId: string,
   authToken: string
 ): Promise<Response> {
   /**Call upstream API with proper headers*/
-  const headers = await getBrowserHeaders(chatId);
+  const headers = getBrowserHeaders(chatId);
   headers["Authorization"] = `Bearer ${authToken}`;
   
+  // 生成请求体JSON字符串用于签名
+  const bodyJson = JSON.stringify(upstreamReq);
+  
+  // 生成签名头部
+  const signatureHeaders = await generateSignatureHeaders(authToken, bodyJson, "POST");
+  Object.assign(headers, signatureHeaders);
+  
   debugLog(`调用上游API: ${config.API_ENDPOINT}`);
-  debugLog(`上游请求体: ${JSON.stringify(upstreamReq)}`);
+  debugLog(`上游请求体: ${bodyJson}`);
   
   const response = await fetch(config.API_ENDPOINT, {
     method: "POST",
     headers,
-    body: JSON.stringify(upstreamReq),
+    body: bodyJson,
     signal: AbortSignal.timeout(60000),
   });
   
   debugLog(`上游响应状态: ${response.status}`);
   return response;
+}
+
+export async function fetchModelsFromAPI(): Promise<unknown[]> {
+  /**Fetch latest models from Z.AI API with anonymous token*/
+  try {
+    // 首先获取匿名 token
+    const authToken = await getAnonymousToken();
+    debugLog(`使用匿名token获取模型: ${authToken.substring(0, 10)}...`);
+
+    const headers = getBrowserHeaders();
+    headers["Accept"] = "application/json";
+    headers["Authorization"] = `Bearer ${authToken}`;
+    headers["User-Agent"] = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0";
+
+    const response = await fetch("https://chat.z.ai/api/models", {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) {
+      debugLog(`获取模型列表失败: ${response.status}`);
+      return [];
+    }
+
+    const data = await response.json();
+    debugLog(`成功获取到模型信息: ${JSON.stringify(data, null, 2)}`);
+    
+    return data.data || [];
+  } catch (error) {
+    debugLog(`获取模型列表异常: ${error}`);
+    return [];
+  }
 }

@@ -4,8 +4,8 @@
 
 import { config } from "./config.ts";
 import { 
-  Message, Delta, Choice, Usage, OpenAIResponse, 
-  UpstreamRequest, UpstreamData, UpstreamError, ModelItem,
+  Delta, OpenAIResponse, 
+  UpstreamRequest, UpstreamData, UpstreamError,
   UpstreamDataSchema
 } from "../models/schemas.ts";
 import { debugLog, callUpstreamApi, transformThinkingContent } from "../utils/helpers.ts";
@@ -80,7 +80,8 @@ export abstract class ResponseHandler {
 export class StreamResponseHandler extends ResponseHandler {
   private hasTools: boolean;
   private bufferedContent: string = "";
-  private toolCalls: any = null;
+  private toolCalls: unknown[] | null = null;
+  private streamEnded: boolean = false; // 防止重复结束流
   
   constructor(upstreamReq: UpstreamRequest, chatId: string, authToken: string, hasTools: boolean = false) {
     super(upstreamReq, chatId, authToken);
@@ -114,11 +115,11 @@ export class StreamResponseHandler extends ResponseHandler {
     
     // Process stream
     debugLog("开始读取上游SSE流");
-    let sentInitialAnswer = false;
+    const sentInitialAnswer = false;
     
     const parser = new SSEParser(response, config.DEBUG_LOGGING);
     try {
-      for await (const event of parser.iterJsonData((data: any) => {
+      for await (const event of parser.iterJsonData((data: unknown) => {
         // Validate with schema
         return UpstreamDataSchema.parse(data);
       })) {
@@ -127,7 +128,10 @@ export class StreamResponseHandler extends ResponseHandler {
         // Check for errors
         if (this._hasError(upstreamData)) {
           const error = this._getError(upstreamData);
-          yield* handleUpstreamError(error);
+          if (!this.streamEnded) {
+            yield* handleUpstreamError(error);
+            this.streamEnded = true;
+          }
           break;
         }
         
@@ -138,14 +142,38 @@ export class StreamResponseHandler extends ResponseHandler {
         yield* this._processContent(upstreamData, sentInitialAnswer);
         
         // Check if done
-        if (upstreamData.data.done || upstreamData.data.phase === "done") {
+        if ((upstreamData.data.done || upstreamData.data.phase === "done") && !this.streamEnded) {
           debugLog("检测到流结束信号");
           yield* this._sendEndChunk();
+          this.streamEnded = true;
           break;
+        }
+      }
+    } catch (streamError) {
+      debugLog(`流处理异常: ${streamError}`);
+      // 确保在异常情况下也能正确结束流
+      if (!this.streamEnded) {
+        try {
+          const errorChunk = createOpenAIResponseChunk(
+            config.PRIMARY_MODEL,
+            undefined,
+            "stop"
+          );
+          yield `data: ${JSON.stringify(errorChunk)}\n\n`;
+          yield "data: [DONE]\n\n";
+          this.streamEnded = true;
+          debugLog("异常情况下强制结束流");
+        } catch (endError) {
+          debugLog(`结束流时发生错误: ${endError}`);
         }
       }
     } finally {
       await parser[Symbol.asyncDispose]();
+      // 最后的保护：确保无论如何都标记为已结束
+      if (!this.streamEnded) {
+        this.streamEnded = true;
+        debugLog("在finally块中标记流为已结束");
+      }
     }
   }
   
@@ -229,13 +257,22 @@ export class StreamResponseHandler extends ResponseHandler {
   }
   
   private _extractEditContent(editContent: string): string {
-    /**Extract content from edit_content field*/
+    /**Extract meaningful content from edit_content HTML*/
+    const blocks = editContent.split(/<glm_block view=""[^>]*>/);
+    if (blocks.length > 1) {
+      return blocks[1];
+    }
     const parts = editContent.split("</details>");
     return parts.length > 1 ? parts[1] : "";
   }
   
   private async *_sendEndChunk(): AsyncGenerator<string, void, unknown> {
-    /**Send end chunk and DONE signal*/
+    /**Send end chunk and DONE signal (with duplicate protection)*/
+    if (this.streamEnded) {
+      debugLog("流已结束，跳过重复的结束信号");
+      return;
+    }
+    
     let finishReason = "stop";
     
     if (this.hasTools) {
@@ -245,7 +282,7 @@ export class StreamResponseHandler extends ResponseHandler {
       if (this.toolCalls) {
         // Send tool calls with proper format
         for (let i = 0; i < this.toolCalls.length; i++) {
-          const tc = this.toolCalls[i];
+          const tc = this.toolCalls[i] as Record<string, unknown>;
           const toolCallDelta = {
             index: i,
             id: tc.id,
@@ -282,6 +319,7 @@ export class StreamResponseHandler extends ResponseHandler {
     );
     yield `data: ${JSON.stringify(endChunk)}\n\n`;
     yield "data: [DONE]\n\n";
+    this.streamEnded = true;
     debugLog("流式响应完成");
   }
 }
@@ -323,7 +361,7 @@ export class NonStreamResponseHandler extends ResponseHandler {
     
     const parser = new SSEParser(response, config.DEBUG_LOGGING);
     try {
-      for await (const event of parser.iterJsonData((data: any) => {
+      for await (const event of parser.iterJsonData((data: unknown) => {
         return UpstreamDataSchema.parse(data);
       })) {
         const upstreamData = event.data as UpstreamData;
@@ -353,7 +391,7 @@ export class NonStreamResponseHandler extends ResponseHandler {
     debugLog(`内容收集完成，最终长度: ${finalContent.length}`);
     
     // Handle tool calls for non-streaming
-    let toolCalls: any = null;
+    let toolCalls: unknown[] | null = null;
     let finishReason = "stop";
     let messageContent: string | null = finalContent;
     
@@ -383,8 +421,8 @@ export class NonStreamResponseHandler extends ResponseHandler {
         index: 0,
         message: {
           role: "assistant",
-          content: messageContent,
-          tool_calls: toolCalls
+          content: messageContent || undefined,
+          tool_calls: toolCalls as Record<string, unknown>[] | undefined
         },
         finish_reason: finishReason
       }],
